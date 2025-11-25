@@ -1,0 +1,24 @@
+@font-face {
+  font-family: "Rockwell-Bold";
+  src: url("./assets/fonts/Rockwell-Bold.ttf") format("truetype");
+  font-style: normal;
+}
+
+@import "tailwindcss";
+
+* {
+  margin: 0;
+  box-sizing: border-box;
+  scroll-behavior: smooth;
+  text-decoration: none;
+}
+
+body {
+  background: #e4e4e4;
+  font-family: "Rockwell-Bold", sans-serif;
+  overflow: hidden;
+}
+
+a {
+  cursor: pointer !important;
+}
