@@ -2,9 +2,6 @@ import React, { useEffect, useRef, useState } from "react";
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
-import { Octree } from "three/addons/math/Octree.js";
-import { Capsule } from "three/addons/math/Capsule.js";
 import myPortfolio from "./assets/glbs/My-Portfolio.glb";
 import { wallpapers } from "./constants";
 import gsap from "gsap";
@@ -28,12 +25,11 @@ export default function App() {
     };
 
     const raycaster = new THREE.Raycaster();
-
     const pointer = new THREE.Vector2();
 
     THREE.ColorManagement.enabled = true;
 
-    const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer.setSize(sizes.width, sizes.height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -42,40 +38,42 @@ export default function App() {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.25;
 
-    // new RGBELoader().load("/hdr/studio.hdr", (hdr) => {
-    //   const pmrem = new THREE.PMREMGenerator(renderer);
-    //   const envMap = pmrem.fromEquirectangular(hdr).texture;
+    const hemi = new THREE.HemisphereLight(0xFFFFFF, 0x444444, 1.2);
+    scene.add(hemi);
 
-    //   scene.environment = envMap;
-    //   scene.background = new THREE.Color(0x0d0d0d);
+    const dir = new THREE.DirectionalLight(0xFFFFFF, 1.8);
+    dir.castShadow = true;
+    dir.position.set(50, 50, 0);
+    dir.target.position.set(0, 0, 0);
+    dir.shadow.mapSize.width = 2048;
+    dir.shadow.mapSize.height = 2048;
+    dir.shadow.camera.left = -100;
+    dir.shadow.camera.right = 100;
+    dir.shadow.camera.top = 100;
+    dir.shadow.camera.bottom = -100;
+    dir.shadow.normalBias = 0.25;
+    scene.add(dir);
 
-    //   scene.environmentIntensity = 0.5;
+    const aspect = sizes.width / sizes.height;
 
-    //   hdr.dispose();
-    //   pmrem.dispose();
-    // });
+    const camera = new THREE.OrthographicCamera(-aspect * 50, aspect * 50, 50, -50, 1, 1000);
+    camera.position.set(24, 16, -50);
 
-    const GRAVITY = 30;
-    const CAPSULE_RADIUS = 0.35;
-    const CAPSULE_HEIGHT = 1;
-    const JUMP_HEIGHT = 10;
-    const MOVE_SPEED = 5;
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
 
     let character = {
       instance: null,
-      isMoving: false
+      moveDistance: 3,
+      jumpHeight: 1,
+      isMoving: false,
+      moveDuration: 0.2,
+      bbox: new THREE.Box3(),
+      footOffset: 0
     };
 
-    const colliderOctree = new Octree();
-    const playerCollider = new Capsule(
-      new THREE.Vector3(0, CAPSULE_RADIUS, 0),
-      new THREE.Vector3(0, CAPSULE_HEIGHT, 0),
-      CAPSULE_RADIUS
-    );
-
-    let targetRotation = 0;
-    let playerVelocity = new THREE.Vector3();
-    let playerOnFloor = false;
+    let groundMesh = null;
+    const colliders = [];
 
     let intersectObject = null;
     const intersectObjects = [];
@@ -90,129 +88,290 @@ export default function App() {
 
     const showModal = (name) => {
       const wallpaper = wallpapers[name];
-      if (wallpaper) {
-        setSelectedWallpaper(wallpaper);
-      }
+      if (wallpaper) setSelectedWallpaper(wallpaper);
     };
+
+    const buildCollidersFromMergedMesh = (
+      mesh,
+      {
+        cellSize = 0.5,
+        minCellsPerCluster = 3,
+        heightAboveGround = 0.05,
+        expand = 0.1,
+        debug = false
+      } = {}
+    ) => {
+      mesh.updateWorldMatrix(true, false);
+
+      const geom = mesh.geometry;
+      if (!geom || !geom.attributes || !geom.attributes.position) return [];
+
+      const posAttr = geom.attributes.position;
+      const vertexCount = posAttr.count;
+
+      const meshBox = new THREE.Box3().setFromObject(mesh);
+      const minY = meshBox.min.y;
+
+      const minX = meshBox.min.x;
+      const minZ = meshBox.min.z;
+
+      const grid = new Map();
+      const worldPos = new THREE.Vector3();
+
+      for (let i = 0; i < vertexCount; i++) {
+        worldPos.set(
+          posAttr.getX(i),
+          posAttr.getY(i),
+          posAttr.getZ(i)
+        );
+
+        mesh.localToWorld(worldPos);
+
+        if (worldPos.y < minY + heightAboveGround) continue;
+
+        const ix = Math.floor((worldPos.x - minX) / cellSize);
+        const iz = Math.floor((worldPos.z - minZ) / cellSize);
+        const key = `${ix},${iz}`;
+
+        if (!grid.has(key)) grid.set(key, { pts: [], ix, iz });
+        grid.get(key).pts.push(worldPos.clone());
+      }
+
+      if (grid.size === 0) return [];
+
+      const visited = new Set();
+      const neighbors = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+      const clusters = [];
+
+      for (const [key, cell] of grid.entries()) {
+        if (visited.has(key)) continue;
+        visited.add(key);
+
+        const queue = [cell];
+        let clusterCells = [cell];
+
+        while (queue.length) {
+          const c = queue.shift();
+          for (const n of neighbors) {
+            const nk = `${c.ix + n[0]},${c.iz + n[1]}`;
+
+            if (!visited.has(nk) && grid.has(nk)) {
+              visited.add(nk);
+              const nc = grid.get(nk);
+              queue.push(nc);
+              clusterCells.push(nc);
+            }
+          }
+        }
+
+        if (clusterCells.length >= minCellsPerCluster) {
+          const box = new THREE.Box3();
+          let first = true;
+          for (const cc of clusterCells) {
+            for (const p of cc.pts) {
+              if (first) {
+                box.min.copy(p); box.max.copy(p); first = false;
+              } else {
+                box.expandByPoint(p);
+              }
+            }
+          }
+
+          box.min.x -= expand; box.min.y -= expand; box.min.z -= expand;
+          box.max.x += expand; box.max.y += expand; box.max.z += expand;
+
+          clusters.push(box);
+        }
+      }
+
+      return clusters;
+    }
 
     const loader = new GLTFLoader();
     loader.load(myPortfolio, function (glb) {
       glb.scene.traverse((child) => {
-        if (intersectObjectNames.includes(child.name)) {
-          intersectObjects.push(child);
-        }
-
         if (child.isMesh) {
           child.castShadow = true;
           child.receiveShadow = true;
 
           if (child.material) {
             child.material.needsUpdate = true;
+            child.material.envMapIntensity = 0.5;
           }
+        }
+
+        if (intersectObjectNames.includes(child.name)) {
+          intersectObjects.push(child);
+          colliders.push(new THREE.Box3().setFromObject(child));
+        }
+
+        if (child.name === "Level_1") {
+          groundMesh = child;
+
+          const boxes = buildCollidersFromMergedMesh(child, {
+            cellSize: 0.6,
+            minCellsPerCluster: 2,
+            heightAboveGround: 0.04,
+            expand: 0.08,
+            debug: true
+          });
+
+          for (const b of boxes) colliders.push(b);
         }
 
         if (child.name === "Man") {
           character.instance = child;
-          playerCollider.start.copy(child.position).add(new THREE.Vector3(0, CAPSULE_RADIUS, 0));
-          playerCollider.end.copy(child.position).add(new THREE.Vector3(0, CAPSULE_HEIGHT, 0));
-        }
-
-        if (child.name === "Level_1") {
-          colliderOctree.fromGraphNode(child);
+          child.updateWorldMatrix(true, true);
         }
       });
 
       scene.add(glb.scene);
-    }, undefined, function (error) {
-      console.error(error);
+
+      if (character.instance) {
+        const charBox = new THREE.Box3().setFromObject(character.instance);
+        character.bbox.copy(charBox);
+        character.footOffset = charBox.min.y - character.instance.position.y;
+
+        const start = character.instance.position.clone();
+        start.y += 200;
+        raycaster.set(start, new THREE.Vector3(0, -1, 0));
+
+        if (groundMesh) {
+          const hits = raycaster.intersectObject(groundMesh, true);
+          if (hits.length > 0) {
+            character.instance.position.y = hits[0].point.y - character.footOffset;
+          } else {
+            character.instance.position.y = -character.footOffset;
+          }
+        } else {
+          character.instance.position.y = -character.footOffset;
+        }
+
+        character.bbox.setFromObject(character.instance);
+      }
+    }, undefined, function (err) {
+      console.error(err);
     });
 
-    const hemi = new THREE.HemisphereLight(0xFFFFFF, 0x444444, 1.2);
-    scene.add(hemi);
+    const getGroundYAt = (x, z) => {
+      if (!groundMesh) return null;
 
-    const dir = new THREE.DirectionalLight(0xFFFFFF, 1.8);
-    dir.castShadow = true;
-    dir.position.set(50, 50, 0);
-    dir.target.position.set(0, 0, 0);
-    dir.shadow.mapSize.width = 4096;
-    dir.shadow.mapSize.height = 4096;
-    dir.shadow.camera.left = -100;
-    dir.shadow.camera.right = 100;
-    dir.shadow.camera.top = 100;
-    dir.shadow.camera.bottom = -100;
-    dir.shadow.normalBias = 0.25;
-    scene.add(dir);
+      const start = new THREE.Vector3(x, 1000, z);
+      raycaster.set(start, new THREE.Vector3(0, -1, 0));
 
-    const dirHelper = new THREE.DirectionalLightHelper(dir, 5);
-    scene.add(dirHelper);
+      const hits = raycaster.intersectObject(groundMesh, true);
+      if (hits.length > 0) return hits[0].point.y;
 
-    const shadowHelper = new THREE.CameraHelper(dir.shadow.camera);
-    scene.add(shadowHelper);
+      return null;
+    };
 
-    const aspect = sizes.width / sizes.height;
+    const handleMoveCharacter = (targetPosition, targetRotation) => {
+      if (!character.instance) return;
 
-    const camera = new THREE.OrthographicCamera(-aspect * 50, aspect * 50, 50, -50, 1, 1000);
-    camera.position.x = 24;
-    camera.position.y = 16;
-    camera.position.z = -50;
+      const groundY = getGroundYAt(targetPosition.x, targetPosition.z);
+      if (groundY === null) {
+        gsap.to(character.instance.position, { y: character.instance.position.y + 0.25, duration: 0.12, yoyo: true, repeat: 1 });
+        return;
+      }
 
-    const controls = new OrbitControls(camera, canvas);
-    controls.enableDamping = true;
+      targetPosition.y = groundY - character.footOffset;
+
+      const maxStep = 1.0;
+      if (Math.abs(targetPosition.y - character.instance.position.y) > maxStep) {
+        gsap.to(character.instance.position, { y: character.instance.position.y + 0.25, duration: 0.12, yoyo: true, repeat: 1 });
+        return;
+      }
+
+      const currentBox = new THREE.Box3().setFromObject(character.instance);
+      const translation = new THREE.Vector3(targetPosition.x - character.instance.position.x, targetPosition.y - character.instance.position.y, targetPosition.z - character.instance.position.z);
+      const futureBox = currentBox.clone().translate(translation);
+
+      const colliding = colliders.some(b => b instanceof THREE.Box3 ? futureBox.intersectsBox(b) : false);
+
+      if (colliding) {
+        gsap.to(character.instance.position, { y: character.instance.position.y + 0.25, duration: 0.12, yoyo: true, repeat: 1 });
+        return;
+      }
+
+      character.isMoving = true;
+      const rotationDiff = ((((targetRotation - character.instance.rotation.y) % (2 * Math.PI)) + 3 * Math.PI) % (2 * Math.PI)) - Math.PI;
+      const finalRotation = character.instance.rotation.y + rotationDiff;
+
+      const timeline = gsap.timeline({
+        onComplete: () => {
+          character.isMoving = false
+        }
+      });
+
+      timeline.to(character.instance.position, {
+        x: targetPosition.x,
+        z: targetPosition.z,
+        y: targetPosition.y,
+        duration: character.moveDuration,
+        onUpdate: () => { character.bbox.setFromObject(character.instance); }
+      }, 0);
+
+      timeline.to(character.instance.rotation, {
+        y: finalRotation,
+        duration: character.moveDuration
+      }, 0);
+
+      timeline.to(character.instance.position, {
+        y: character.instance.position.y + character.jumpHeight,
+        duration: character.moveDuration / 2,
+        yoyo: true,
+        repeat: 1
+      }, 0);
+    };
 
     const handleResize = () => {
-      sizes.width = window.innerWidth;
-      sizes.height = window.innerHeight;
-
-      const aspect = sizes.width / sizes.height;
-      camera.left = -aspect * 50;
-      camera.right = aspect * 50;
+      sizes.width = window.innerWidth; sizes.height = window.innerHeight;
+      const aspect2 = sizes.width / sizes.height;
+      camera.left = -aspect2 * 50; camera.right = aspect2 * 50;
       camera.updateProjectionMatrix();
 
       renderer.setSize(sizes.width, sizes.height);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     };
 
-    const handlePointerMove = (event) => {
-      pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
-      pointer.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    const handlePointerMove = (e) => {
+      pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+      pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
     };
 
     const handleClick = () => {
-      if (intersectObject != null) {
-        showModal(intersectObject);
-      }
+      if (intersectObject) showModal(intersectObject);
     };
 
     const handleKeyDown = (event) => {
+      if (!character.instance) return;
       if (character.isMoving) return;
+
+      const targetPosition = character.instance.position.clone();
+      let targetRotation = 0;
 
       switch (event.key.toLowerCase()) {
         case "w":
         case "arrowup":
-          playerVelocity.z += MOVE_SPEED;
-          targetRotation = 0;
+          targetPosition.z += character.moveDistance; targetRotation = 0;
           break;
         case "a":
         case "arrowleft":
-          playerVelocity.x += MOVE_SPEED;
-          targetRotation = -Math.PI / 2;
+          targetPosition.x += character.moveDistance; targetRotation = -Math.PI / 2;
           break;
         case "s":
         case "arrowdown":
-          playerVelocity.z -= MOVE_SPEED;
-          targetRotation = Math.PI;
+          targetPosition.z -= character.moveDistance; targetRotation = Math.PI;
           break;
         case "d":
         case "arrowright":
-          playerVelocity.x -= MOVE_SPEED;
-          targetRotation = Math.PI / 2;
+          targetPosition.x -= character.moveDistance; targetRotation = Math.PI / 2;
           break;
         default:
           return;
-      };
+      }
 
-      playerVelocity.y = JUMP_HEIGHT;
-      character.isMoving = true;
+      handleMoveCharacter(targetPosition, targetRotation);
     };
 
     window.addEventListener("resize", handleResize);
@@ -220,66 +379,29 @@ export default function App() {
     window.addEventListener("click", handleClick);
     window.addEventListener("keydown", handleKeyDown);
 
-    const playerCollisions = () => {
-      const result = colliderOctree.capsuleIntersect(playerCollider);
-      playerOnFloor = false;
-
-      if (result) {
-        playerOnFloor = result.normal.y > 0;
-        playerCollider.translate(result.normal.multiplyScalar(result.depth));
-
-        if (playerOnFloor) {
-          character.isMoving = false;
-          playerVelocity.x = 0;
-          playerVelocity.z = 0;
-        }
-      }
-    };
-
-    const updatePlayer = () => {
-      if (!character.instance) return;
-
-      if (!playerOnFloor) {
-        playerVelocity.y -= GRAVITY * 0.035;
-      }
-
-      playerCollider.translate(playerVelocity.clone().multiplyScalar(0.035));
-
-      playerCollisions();
-
-      character.instance.position.copy(playerCollider.start);
-      character.instance.position.y -= CAPSULE_RADIUS;
-
-      let rotationDiff = ((((targetRotation - character.instance.rotation.y) % (2 * Math.PI)) + 3 * Math.PI) % (2 * Math.PI)) - Math.PI;
-      let finalRotation = character.instance.rotation.y + rotationDiff;
-
-      character.instance.rotation.y = THREE.MathUtils.lerp(
-        character.instance.rotation.y,
-        finalRotation,
-        0.4
-      );
-    };
-
     const animate = () => {
-      updatePlayer();
-
       raycaster.setFromCamera(pointer, camera);
 
-      const intersects = raycaster.intersectObjects(intersectObjects);
-
+      const intersects = raycaster.intersectObjects(intersectObjects, true);
       if (intersects.length > 0) {
         document.body.style.cursor = "pointer";
+
+        let foundName = null;
+        for (let i = 0; i < intersects.length; i++) {
+          let obj = intersects[i].object;
+          while (obj && !intersectObjectNames.includes(obj.name) && obj.parent) obj = obj.parent;
+          if (obj && intersectObjectNames.includes(obj.name)) { foundName = obj.name; break; }
+        }
+
+        intersectObject = foundName;
       } else {
         document.body.style.cursor = "default";
         intersectObject = null;
       }
 
-      for (let i = 0; i < intersects.length; i++) {
-        intersectObject = intersects[0].object.parent.name;
-      }
+      if (character.instance) character.bbox.setFromObject(character.instance);
 
       controls.update();
-
       renderer.render(scene, camera);
     };
 
@@ -287,8 +409,32 @@ export default function App() {
 
     return () => {
       window.removeEventListener("resize", handleResize);
-      renderer.dispose();
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("click", handleClick);
+      window.removeEventListener("keydown", handleKeyDown);
+
+      renderer.setAnimationLoop(null);
+      controls.dispose();
+
+      scene.traverse((obj) => {
+        if (obj.isMesh) {
+          obj.geometry?.dispose();
+          if (obj.material) {
+            if (Array.isArray(obj.material)) {
+              obj.material.forEach(m => {
+                m.map?.dispose();
+                m.dispose();
+              });
+            } else {
+              obj.material.map?.dispose();
+              obj.material.dispose();
+            }
+          }
+        }
+      });
+
       scene.clear();
+      renderer.dispose();
     };
   }, []);
 
