@@ -59,6 +59,8 @@ export default function App() {
     const camera = new THREE.OrthographicCamera(-aspect * 50, aspect * 50, 50, -50, 1, 1000);
     camera.position.set(24, 16, -50);
 
+    const cameraOffset = new THREE.Vector3(24, 16, -50);
+
     const controls = new OrbitControls(camera, canvas);
     controls.enableDamping = true;
 
@@ -381,6 +383,12 @@ export default function App() {
 
     const animate = () => {
       raycaster.setFromCamera(pointer, camera);
+
+      // if (character.instance) {
+      //   const targetCameraPosition = new THREE.Vector3(character.instance.position.x + cameraOffset.x, cameraOffset.y, character.instance.position.z + cameraOffset.z);
+      //   camera.position.copy(targetCameraPosition);
+      //   camera.lookAt(character.instance.position.x, camera.position.y - 38, character.instance.position.z);
+      // }
 
       const intersects = raycaster.intersectObjects(intersectObjects, true);
       if (intersects.length > 0) {
